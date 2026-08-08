@@ -1,0 +1,118 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import sqlite3
+import plotly.express as px
+import hashlib
+from datetime import datetime, date
+
+# 
+# CONFIG & DATABASE INIT
+# 
+st.set_page_config(
+    page_title="DCDMD Dashboard",
+    page_icon="4ca",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+DB = 'dashboard_data.db'
+
+COLORS = {
+    'loan':  "#9D0A0A",
+    'grant': "#065C2A",
+    'other': '#95A5A6',
+    'bg':    '#0E1117',
+    'card':  '#1E2130',
+}
+
+def get_conn():
+    return sqlite3.connect(DB)
+
+def init_db():
+    conn = get_conn()
+    # Ensure Users table exists with the new user-specific security columns
+    conn.execute('''CREATE TABLE IF NOT EXISTS Users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE,
+        password TEXT,
+        role TEXT,
+        allowed_partners TEXT,
+        view_only INTEGER,
+        hidden_columns TEXT DEFAULT '',
+        hidden_projects TEXT DEFAULT ''
+    )''')
+    
+    # Graceful migration for existing databases
+    try: conn.execute("ALTER TABLE Users ADD COLUMN hidden_columns TEXT DEFAULT ''")
+    except: pass
+    try: conn.execute("ALTER TABLE Users ADD COLUMN hidden_projects TEXT DEFAULT ''")
+    except: pass
+
+    conn.execute('''CREATE TABLE IF NOT EXISTS Upload_Batches (
+        batch_id TEXT PRIMARY KEY,
+        file_name TEXT,
+        file_currency TEXT,
+        uploaded_by TEXT,
+        uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        row_count INTEGER DEFAULT 0,
+        instrument_count INTEGER DEFAULT 0
+    )''')
+    
+    # Create default admin if not exists
+    try:
+        conn.execute("INSERT INTO Users (username, password, role, allowed_partners, view_only) VALUES (?,?,?,?,?)",
+                     ('admin', hashlib.sha256('admin'.encode()).hexdigest(), 'Admin', 'All', 0))
+    except: pass
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# 
+# HELPERS
+# 
+def hash_pw(pw):
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+def log_action(username, action, detail=""):
+    conn = get_conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS Audit_Log (username TEXT, action TEXT, detail TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
+    conn.execute("INSERT INTO Audit_Log (username, action, detail) VALUES (?,?,?)", (username, action, detail))
+    conn.commit()
+    conn.close()
+
+def get_fyp(year):
+    try:
+        y = int(year)
+        if 2018 <= y <= 2023: return "12th FYP (2018-2023)"
+        elif 2024 <= y <= 2029: return "13th FYP (2024-2029)"
+        elif 2030 <= y <= 2035: return "14th FYP (2030-2035)"
+        else: return "Other / Beyond 14th"
+    except: return "Unknown"
+
+def clean_val(v):
+    if v is None:
+        return None
+    s = str(v).strip()
+    return None if s in ('', 'nan', 'NaN', 'None') else s
+
+def clean_amount(v):
+    try:
+        s = str(v).replace(',', '').strip()
+        if s in ('', '-', 'nan', 'NaN', 'None'):
+            return 0.0
+        return float(s)
+    except:
+        return 0.0
+
+def first_non_empty(series, default=''):
+    for val in series:
+        if pd.notna(val):
+            sval = str(val).strip()
+            if sval and sval not in ('nan', 'NaN', 'None', 'N/A'):
+                return val
+    return default
+
+# ... (rest of original file)
