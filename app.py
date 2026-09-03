@@ -1313,52 +1313,54 @@ def page_upload():
                                     r['instrument_id'], int(r['year']),
                                     float(r['amount']), batch_id, detected_fmt
                                 ))
-                                project_sql_keep = '''
-    INSERT INTO Projects (
-        instrument_id, title, agreement_structure, creditor,
-        agreement_date, maturity_date, amount, revised_amount,
-        economic_sector, instrument_fund_use,
-        main_implementing_agency, currency, upload_id, file_type
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(instrument_id) DO UPDATE SET
-        title = CASE WHEN Projects.title IS NULL OR Projects.title='' THEN NULLIF(excluded.title,'') ELSE Projects.title END,
-        agreement_structure = CASE WHEN Projects.agreement_structure IS NULL OR Projects.agreement_structure='' THEN NULLIF(excluded.agreement_structure,'') ELSE Projects.agreement_structure END,
-        creditor = CASE WHEN Projects.creditor IS NULL OR Projects.creditor='' THEN NULLIF(excluded.creditor,'') ELSE Projects.creditor END,
-        agreement_date = CASE WHEN Projects.agreement_date IS NULL OR Projects.agreement_date='' THEN NULLIF(excluded.agreement_date,'') ELSE Projects.agreement_date END,
-        maturity_date = CASE WHEN Projects.maturity_date IS NULL OR Projects.maturity_date='' THEN NULLIF(excluded.maturity_date,'') ELSE Projects.maturity_date END,
-        amount = CASE WHEN Projects.amount IS NULL THEN excluded.amount ELSE Projects.amount END,
-        revised_amount = CASE WHEN Projects.revised_amount IS NULL THEN excluded.revised_amount ELSE Projects.revised_amount END,
-        economic_sector = CASE WHEN Projects.economic_sector IS NULL OR Projects.economic_sector='' THEN NULLIF(excluded.economic_sector,'') ELSE Projects.economic_sector END,
-        instrument_fund_use = CASE WHEN Projects.instrument_fund_use IS NULL OR Projects.instrument_fund_use='' THEN NULLIF(excluded.instrument_fund_use,'') ELSE Projects.instrument_fund_use END,
-        main_implementing_agency = CASE WHEN Projects.main_implementing_agency IS NULL OR Projects.main_implementing_agency='' THEN NULLIF(excluded.main_implementing_agency,'') ELSE Projects.main_implementing_agency END,
-        currency = CASE WHEN Projects.currency IS NULL OR Projects.currency='' THEN NULLIF(excluded.currency,'') ELSE Projects.currency END,
-        upload_id = excluded.upload_id,
-        file_type = excluded.file_type
-'''
-                                # ── SQL: overwrite amounts (user confirmed) ───────────
-                                project_sql_overwrite = '''
-    INSERT INTO Projects (
-        instrument_id, title, agreement_structure, creditor,
-        agreement_date, maturity_date, amount, revised_amount,
-        economic_sector, instrument_fund_use,
-        main_implementing_agency, currency, upload_id, file_type
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(instrument_id) DO UPDATE SET
-        title = CASE WHEN Projects.title IS NULL OR Projects.title='' THEN NULLIF(excluded.title,'') ELSE Projects.title END,
-        agreement_structure = CASE WHEN Projects.agreement_structure IS NULL OR Projects.agreement_structure='' THEN NULLIF(excluded.agreement_structure,'') ELSE Projects.agreement_structure END,
-        creditor = CASE WHEN Projects.creditor IS NULL OR Projects.creditor='' THEN NULLIF(excluded.creditor,'') ELSE Projects.creditor END,
-        agreement_date = CASE WHEN Projects.agreement_date IS NULL OR Projects.agreement_date='' THEN NULLIF(excluded.agreement_date,'') ELSE Projects.agreement_date END,
-        maturity_date = CASE WHEN Projects.maturity_date IS NULL OR Projects.maturity_date='' THEN NULLIF(excluded.maturity_date,'') ELSE Projects.maturity_date END,
-        amount = COALESCE(excluded.amount, Projects.amount),
-        revised_amount = COALESCE(excluded.revised_amount, Projects.revised_amount),
-        economic_sector = CASE WHEN Projects.economic_sector IS NULL OR Projects.economic_sector='' THEN NULLIF(excluded.economic_sector,'') ELSE Projects.economic_sector END,
-        instrument_fund_use = CASE WHEN Projects.instrument_fund_use IS NULL OR Projects.instrument_fund_use='' THEN NULLIF(excluded.instrument_fund_use,'') ELSE Projects.instrument_fund_use END,
-        main_implementing_agency = CASE WHEN Projects.main_implementing_agency IS NULL OR Projects.main_implementing_agency='' THEN NULLIF(excluded.main_implementing_agency,'') ELSE Projects.main_implementing_agency END,
-        currency = COALESCE(excluded.currency, Projects.currency),
-        upload_id = excluded.upload_id,
-        file_type = excluded.file_type
-'''
-                               
+
+                        # ── SQL: NULL-fill only (default / keep mode) ─────────
+                        project_sql_keep = '''
+                            INSERT INTO Projects (
+                                instrument_id, title, agreement_structure, creditor,
+                                agreement_date, maturity_date, amount, revised_amount,
+                                economic_sector, instrument_fund_use,
+                                main_implementing_agency, currency, upload_id, file_type
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            ON CONFLICT(instrument_id) DO UPDATE SET
+                                title = CASE WHEN Projects.title IS NULL OR Projects.title='' THEN NULLIF(excluded.title,'') ELSE Projects.title END,
+                                agreement_structure = CASE WHEN Projects.agreement_structure IS NULL OR Projects.agreement_structure='' THEN NULLIF(excluded.agreement_structure,'') ELSE Projects.agreement_structure END,
+                                creditor = CASE WHEN Projects.creditor IS NULL OR Projects.creditor='' THEN NULLIF(excluded.creditor,'') ELSE Projects.creditor END,
+                                agreement_date = CASE WHEN Projects.agreement_date IS NULL OR Projects.agreement_date='' THEN NULLIF(excluded.agreement_date,'') ELSE Projects.agreement_date END,
+                                maturity_date = CASE WHEN Projects.maturity_date IS NULL OR Projects.maturity_date='' THEN NULLIF(excluded.maturity_date,'') ELSE Projects.maturity_date END,
+                                amount = CASE WHEN Projects.amount IS NULL THEN excluded.amount ELSE Projects.amount END,
+                                revised_amount = CASE WHEN Projects.revised_amount IS NULL THEN excluded.revised_amount ELSE Projects.revised_amount END,
+                                economic_sector = CASE WHEN Projects.economic_sector IS NULL OR Projects.economic_sector='' THEN NULLIF(excluded.economic_sector,'') ELSE Projects.economic_sector END,
+                                instrument_fund_use = CASE WHEN Projects.instrument_fund_use IS NULL OR Projects.instrument_fund_use='' THEN NULLIF(excluded.instrument_fund_use,'') ELSE Projects.instrument_fund_use END,
+                                main_implementing_agency = CASE WHEN Projects.main_implementing_agency IS NULL OR Projects.main_implementing_agency='' THEN NULLIF(excluded.main_implementing_agency,'') ELSE Projects.main_implementing_agency END,
+                                currency = CASE WHEN Projects.currency IS NULL OR Projects.currency='' THEN NULLIF(excluded.currency,'') ELSE Projects.currency END,
+                                upload_id = excluded.upload_id,
+                                file_type = excluded.file_type
+                        '''
+
+                        # ── SQL: overwrite amounts (user confirmed) ───────────
+                        project_sql_overwrite = '''
+                            INSERT INTO Projects (
+                                instrument_id, title, agreement_structure, creditor,
+                                agreement_date, maturity_date, amount, revised_amount,
+                                economic_sector, instrument_fund_use,
+                                main_implementing_agency, currency, upload_id, file_type
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            ON CONFLICT(instrument_id) DO UPDATE SET
+                                title = CASE WHEN Projects.title IS NULL OR Projects.title='' THEN NULLIF(excluded.title,'') ELSE Projects.title END,
+                                agreement_structure = CASE WHEN Projects.agreement_structure IS NULL OR Projects.agreement_structure='' THEN NULLIF(excluded.agreement_structure,'') ELSE Projects.agreement_structure END,
+                                creditor = CASE WHEN Projects.creditor IS NULL OR Projects.creditor='' THEN NULLIF(excluded.creditor,'') ELSE Projects.creditor END,
+                                agreement_date = CASE WHEN Projects.agreement_date IS NULL OR Projects.agreement_date='' THEN NULLIF(excluded.agreement_date,'') ELSE Projects.agreement_date END,
+                                maturity_date = CASE WHEN Projects.maturity_date IS NULL OR Projects.maturity_date='' THEN NULLIF(excluded.maturity_date,'') ELSE Projects.maturity_date END,
+                                amount = COALESCE(excluded.amount, Projects.amount),
+                                revised_amount = COALESCE(excluded.revised_amount, Projects.revised_amount),
+                                economic_sector = CASE WHEN Projects.economic_sector IS NULL OR Projects.economic_sector='' THEN NULLIF(excluded.economic_sector,'') ELSE Projects.economic_sector END,
+                                instrument_fund_use = CASE WHEN Projects.instrument_fund_use IS NULL OR Projects.instrument_fund_use='' THEN NULLIF(excluded.instrument_fund_use,'') ELSE Projects.instrument_fund_use END,
+                                main_implementing_agency = CASE WHEN Projects.main_implementing_agency IS NULL OR Projects.main_implementing_agency='' THEN NULLIF(excluded.main_implementing_agency,'') ELSE Projects.main_implementing_agency END,
+                                currency = COALESCE(excluded.currency, Projects.currency),
+                                upload_id = excluded.upload_id,
+                                file_type = excluded.file_type
+                        '''
 
                         # Disbursements: keep existing OR overwrite
                         disb_sql_keep = '''
@@ -1553,6 +1555,12 @@ def page_users():
     if 'user_edit_sel' not in st.session_state:
         st.session_state['user_edit_sel'] = '— select —'
 
+    # Apply any pending reset (queued from the save handler below) BEFORE
+    # the selectbox widget is instantiated — Streamlit forbids writing to a
+    # widget's session_state key after it has already rendered this run.
+    if st.session_state.pop('_reset_user_sel', False):
+        st.session_state['user_edit_sel'] = '— select —'
+
     def _on_user_sel_change():
         for k in ['_uf_role', '_uf_view_only', '_uf_hcols', '_uf_hprojs', '_uf_hpart']:
             st.session_state.pop(k, None)
@@ -1660,7 +1668,7 @@ def page_users():
                 log_action(st.session_state.username, "USER_SAVE",
                            f"Saved user: {new_user}, hidden_partners={hidden_part_str}")
                 st.success(f"✅ User '{new_user}' saved.")
-                st.session_state['user_edit_sel'] = '— select —'
+                st.session_state['_reset_user_sel'] = True
                 st.rerun()
 
     st.markdown("---")
@@ -1714,5 +1722,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-    
