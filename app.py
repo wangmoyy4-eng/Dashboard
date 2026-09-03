@@ -1313,8 +1313,7 @@ def page_upload():
                                     r['instrument_id'], int(r['year']),
                                     float(r['amount']), batch_id, detected_fmt
                                 ))
-                                # ── SQL: NULL-fill only (default / keep mode) ─────────
-project_sql_keep = '''
+                                project_sql_keep = '''
     INSERT INTO Projects (
         instrument_id, title, agreement_structure, creditor,
         agreement_date, maturity_date, amount, revised_amount,
@@ -1336,9 +1335,8 @@ project_sql_keep = '''
         upload_id = excluded.upload_id,
         file_type = excluded.file_type
 '''
-
-# ── SQL: overwrite amounts (user confirmed) ───────────
-project_sql_overwrite = '''
+                                # ── SQL: overwrite amounts (user confirmed) ───────────
+                                project_sql_overwrite = '''
     INSERT INTO Projects (
         instrument_id, title, agreement_structure, creditor,
         agreement_date, maturity_date, amount, revised_amount,
