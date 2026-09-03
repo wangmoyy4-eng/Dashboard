@@ -100,6 +100,7 @@ def parse_flat(df_raw, header_row, col_map, year_cols, user_currency, capture_di
     mdate_idx  = gi('Maturity Date')
     amt_idx    = gi('Amount')
     rev_idx    = gi('Revised Amount')
+    agency_idx = gi('Main Implementing Agency Name', 'Main Implementing Agency')
 
     projects = {}
     disbursements = []
@@ -122,15 +123,15 @@ def parse_flat(df_raw, header_row, col_map, year_cols, user_currency, capture_di
         p = {
             'instrument_id': inst_id,
             'title': title,
-            'agreement_structure': clean_val(row[struct_idx]) if struct_idx else None,
+            'agreement_structure': clean_val(row[struct_idx]) if struct_idx is not None else None,
             'creditor': creditor,
-            'agreement_date': clean_date(row[adate_idx]) if adate_idx else None,
-            'maturity_date': clean_date(row[mdate_idx]) if mdate_idx else None,
-            'amount': clean_num(row[amt_idx]) if amt_idx else None,
-            'revised_amount': clean_num(row[rev_idx]) if rev_idx else None,
+            'agreement_date': clean_date(row[adate_idx]) if adate_idx is not None else None,
+            'maturity_date': clean_date(row[mdate_idx]) if mdate_idx is not None else None,
+            'amount': clean_num(row[amt_idx]) if amt_idx is not None else None,
+            'revised_amount': clean_num(row[rev_idx]) if rev_idx is not None else None,
             'economic_sector': None,
             'instrument_fund_use': None,
-            'main_implementing_agency': None,
+            'main_implementing_agency': clean_val(row[agency_idx]) if agency_idx is not None else None,
             'currency': user_currency,
         }
         projects[inst_id] = p
@@ -514,7 +515,12 @@ def parse_aggregate_wizard(file_obj, user_currency):
                         'main_implementing_agency': None,
                         'currency': user_currency,
                     }
-                continue
+                # Don't skip to the next row here — some exports (dense,
+                # single-row-per-instrument layouts) put title/creditor/
+                # agency/measures on this SAME row as the ID, not on
+                # separate rows below it like the classic step-down
+                # Aggregate Wizard layout does. Falling through lets both
+                # layouts be read by the same field-filling logic below.
 
         if current_id is None:
             continue
