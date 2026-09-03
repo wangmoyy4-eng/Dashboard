@@ -1,15 +1,17 @@
 import os
+import io
+import json
 import streamlit as st
 import pandas as pd
 import numpy as np
-import sqlite3
+import psycopg2
+from sqlalchemy import create_engine
+from urllib.parse import quote_plus
 import plotly.express as px
 import hashlib
 import re
-import shutil
 import traceback
 from datetime import datetime, date, time as dt_time
-from pathlib import Path
 
 # ─────────────────────────────────────────────
 # OPENPYXL BUG FIX
@@ -34,7 +36,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-DB = os.environ.get('DASHBOARD_DB_PATH', 'dashboard_data.db')
 COLORS = {
     'loan':  '#E74C3C',
     'grant': '#2ECC71',
@@ -159,32 +160,101 @@ def parse_upload_file(file_obj, user_currency, capture_disbursements=True):
 
 
 # ─────────────────────────────────────────────
-# DATABASE INIT
+# DATABASE INIT — Postgres (Supabase), sqlite3-compatible wrapper
 # ─────────────────────────────────────────────
-def get_db_path() -> Path:
-    return Path(DB).resolve()
+@st.cache_resource(show_spinner=False)
+def get_engine():
+    """One pooled SQLAlchemy engine per running app process. Reused across
+    reruns and sessions so we don't open a fresh socket to Supabase on every
+    interaction."""
+    cfg = st.secrets["postgres"]
+    url = (
+        f"postgresql+psycopg2://{cfg['user']}:{quote_plus(str(cfg['password']))}"
+        f"@{cfg['host']}:{cfg['port']}/{cfg['dbname']}"
+    )
+    return create_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=10)
 
 
-def backup_db(backup_dir='backups'):
-    db_path = get_db_path()
-    if not db_path.exists():
-        return None
-    backup_folder = db_path.parent / backup_dir
-    backup_folder.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_file = backup_folder / f"{db_path.stem}_{timestamp}.db"
-    shutil.copy2(db_path, backup_file)
-    return str(backup_file)
+class _CursorWrapper:
+    """Makes a psycopg2 cursor accept the same `?`-style SQL the app already
+    uses everywhere, by translating to psycopg2's `%s` placeholder style."""
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, sql, params=None):
+        self._cur.execute(sql.replace('?', '%s'), params)
+        return self
+
+    def executemany(self, sql, seq_of_params):
+        self._cur.executemany(sql.replace('?', '%s'), seq_of_params)
+        return self
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+    def __iter__(self):
+        return iter(self._cur)
+
+
+class PGConn:
+    """Thin sqlite3.Connection-compatible wrapper around a psycopg2
+    connection, so `conn.execute(...)`, `conn.executemany(...)`,
+    `conn.cursor()`, and `with get_conn() as conn:` all keep working exactly
+    as they did against SQLite."""
+    def __init__(self, raw_conn):
+        object.__setattr__(self, '_conn', raw_conn)
+
+    def cursor(self):
+        return _CursorWrapper(self._conn.cursor())
+
+    def execute(self, sql, params=None):
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def executemany(self, sql, seq_of_params):
+        cur = self.cursor()
+        cur.executemany(sql, seq_of_params)
+        return cur
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self._conn.commit()
+        else:
+            self._conn.rollback()
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
 
 
 def get_conn():
-    return sqlite3.connect(DB, check_same_thread=False)
+    """Pulls a connection from the pooled engine. Call .close() when done
+    (or use `with get_conn() as conn:`) — this returns it to the pool rather
+    than tearing down the socket."""
+    return PGConn(get_engine().raw_connection())
+
+
+def export_backup_json():
+    """Snapshot of the core tables as JSON, used to give the admin a
+    downloadable safety copy before a destructive delete/wipe. (Postgres on
+    Supabase is durable on its own — this is a convenience export, not a
+    substitute for Supabase's own backups.)"""
+    engine = get_engine()
+    payload = {}
+    for tbl in ['Projects', 'Disbursements', 'Upload_Batches']:
+        df = pd.read_sql(f"SELECT * FROM {tbl}", engine)
+        payload[tbl] = df.to_dict(orient='records')
+    return json.dumps(payload, default=str, indent=2).encode('utf-8')
 
 
 def init_db():
     conn = get_conn()
     conn.execute('''CREATE TABLE IF NOT EXISTS Users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         username TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
         role TEXT NOT NULL,
@@ -194,22 +264,20 @@ def init_db():
         hidden_projects TEXT DEFAULT '',
         hidden_partners TEXT DEFAULT ''
     )''')
-    try:
-        conn.execute(
-            "INSERT INTO Users (username,password,role,allowed_partners,view_only) VALUES (?,?,?,?,?)",
-            ('admin', hashlib.sha256('admin'.encode()).hexdigest(), 'Admin', 'All', 0)
-        )
-    except sqlite3.IntegrityError:
-        pass
+    conn.execute('''
+        INSERT INTO Users (username,password,role,allowed_partners,view_only)
+        VALUES (?,?,?,?,?)
+        ON CONFLICT (username) DO NOTHING
+    ''', ('admin', hashlib.sha256('admin'.encode()).hexdigest(), 'Admin', 'All', 0))
 
     conn.execute('''CREATE TABLE IF NOT EXISTS Audit_Log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         username TEXT, action TEXT, detail TEXT,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
 
     conn.execute('''CREATE TABLE IF NOT EXISTS FYP_Config (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         name TEXT UNIQUE NOT NULL,
         start_year INTEGER NOT NULL,
         end_year INTEGER NOT NULL
@@ -238,7 +306,11 @@ def init_db():
         last_updated TEXT
     )''')
     if conn.execute("SELECT COUNT(*) FROM Exchange_Rates").fetchone()[0] == 0:
-        conn.executemany("INSERT OR IGNORE INTO Exchange_Rates (currency_code,rate_to_btn,last_updated) VALUES (?,?,?)", [
+        conn.executemany('''
+            INSERT INTO Exchange_Rates (currency_code,rate_to_btn,last_updated)
+            VALUES (?,?,?)
+            ON CONFLICT (currency_code) DO NOTHING
+        ''', [
             ('BTN', 1.0, date.today().isoformat()),
             ('INR', 1.0, date.today().isoformat()),
             ('USD', 83.0, date.today().isoformat()),
@@ -271,25 +343,25 @@ def init_db():
     )''')
 
     for alter_sql in [
-        "ALTER TABLE Projects ADD COLUMN upload_id TEXT",
-        "ALTER TABLE Projects ADD COLUMN file_type TEXT",
-        "ALTER TABLE Disbursements ADD COLUMN upload_id TEXT",
-        "ALTER TABLE Disbursements ADD COLUMN file_type TEXT",
-        "ALTER TABLE Upload_Batches ADD COLUMN currency TEXT",
-        "ALTER TABLE Upload_Batches ADD COLUMN record_count INTEGER DEFAULT 0",
-        "ALTER TABLE Upload_Batches ADD COLUMN file_type TEXT",
-        "ALTER TABLE Users ADD COLUMN hidden_partners TEXT DEFAULT ''",
+        "ALTER TABLE Projects ADD COLUMN IF NOT EXISTS upload_id TEXT",
+        "ALTER TABLE Projects ADD COLUMN IF NOT EXISTS file_type TEXT",
+        "ALTER TABLE Disbursements ADD COLUMN IF NOT EXISTS upload_id TEXT",
+        "ALTER TABLE Disbursements ADD COLUMN IF NOT EXISTS file_type TEXT",
+        "ALTER TABLE Upload_Batches ADD COLUMN IF NOT EXISTS currency TEXT",
+        "ALTER TABLE Upload_Batches ADD COLUMN IF NOT EXISTS record_count INTEGER DEFAULT 0",
+        "ALTER TABLE Upload_Batches ADD COLUMN IF NOT EXISTS file_type TEXT",
+        "ALTER TABLE Users ADD COLUMN IF NOT EXISTS hidden_partners TEXT DEFAULT ''",
     ]:
         try:
             conn.execute(alter_sql)
-        except sqlite3.OperationalError:
-            pass
+        except Exception:
+            conn.rollback()
 
     try:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_disburse_instrument_year ON Disbursements(instrument_id, year)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_currency ON Projects(currency)")
-    except sqlite3.OperationalError:
-        pass
+    except Exception:
+        conn.rollback()
 
     conn.commit()
     conn.close()
@@ -505,23 +577,28 @@ def check_conflicts(df_projects, df_disb):
     if not ids:
         return proj_conflicts, disb_conflicts
 
-    placeholders = ','.join(['?'] * len(ids))
-
     try:
         conn = get_conn()
+        cur = conn.cursor()
 
         # ── Project amount fields ────────────────────────────────────────────
-        existing_proj = pd.read_sql(
-            f"SELECT instrument_id, amount, revised_amount FROM Projects "
-            f"WHERE instrument_id IN ({placeholders})",
-            conn, params=ids
+        cur.execute(
+            "SELECT instrument_id, amount, revised_amount FROM Projects "
+            "WHERE instrument_id = ANY(%s)",
+            (ids,)
+        )
+        existing_proj = pd.DataFrame(
+            cur.fetchall(), columns=['instrument_id', 'amount', 'revised_amount']
         )
 
         # ── Disbursement amounts ─────────────────────────────────────────────
-        existing_disb = pd.read_sql(
-            f"SELECT instrument_id, year, amount FROM Disbursements "
-            f"WHERE instrument_id IN ({placeholders})",
-            conn, params=ids
+        cur.execute(
+            "SELECT instrument_id, year, amount FROM Disbursements "
+            "WHERE instrument_id = ANY(%s)",
+            (ids,)
+        )
+        existing_disb = pd.DataFrame(
+            cur.fetchall(), columns=['instrument_id', 'year', 'amount']
         )
         conn.close()
 
@@ -644,7 +721,7 @@ def render_sidebar():
 def page_dashboard():
     st.title("📊 DCDMD Project Dashboard")
 
-    conn = get_conn()
+    engine = get_engine()
     df_all = pd.read_sql('''
         SELECT p.instrument_id, p.title, p.agreement_structure, p.creditor,
                p.agreement_date, p.maturity_date, p.amount, p.revised_amount,
@@ -653,10 +730,9 @@ def page_dashboard():
                d.year AS disbursement_year, d.amount AS disbursed_amount
         FROM Projects p
         LEFT JOIN Disbursements d ON p.instrument_id = d.instrument_id
-    ''', conn)
-    rates_df   = pd.read_sql("SELECT * FROM Exchange_Rates", conn).set_index('currency_code')
-    fyp_config = pd.read_sql("SELECT * FROM FYP_Config ORDER BY start_year", conn)
-    conn.close()
+    ''', engine)
+    rates_df   = pd.read_sql("SELECT * FROM Exchange_Rates", engine).set_index('currency_code')
+    fyp_config = pd.read_sql("SELECT * FROM FYP_Config ORDER BY start_year", engine)
 
     if df_all.empty:
         return st.warning("⚠️ No data yet. Admin must upload reports first.")
@@ -1028,12 +1104,11 @@ def page_rates():
     st.title("💱 Exchange Rates")
     st.caption("All amounts are converted to BTN using these rates. 1 BTN = 1 BTN and 1 INR = 1 BTN by default.")
 
-    conn = get_conn()
+    engine = get_engine()
     rates = pd.read_sql(
         "SELECT currency_code, rate_to_btn, last_updated FROM Exchange_Rates ORDER BY currency_code",
-        conn
+        engine
     )
-    conn.close()
 
     st.dataframe(
         rates.rename(columns={
@@ -1047,9 +1122,7 @@ def page_rates():
     st.markdown("---")
     st.subheader("Add / Edit Rate")
 
-    conn2 = get_conn()
-    existing_codes = pd.read_sql("SELECT currency_code FROM Exchange_Rates", conn2)['currency_code'].tolist()
-    conn2.close()
+    existing_codes = pd.read_sql("SELECT currency_code FROM Exchange_Rates", engine)['currency_code'].tolist()
 
     c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
     with c1:
@@ -1351,14 +1424,12 @@ def page_upload():
     st.markdown("---")
     st.markdown("### 📂 Upload History")
 
-    conn = get_conn()
     batches = pd.read_sql(
-        "SELECT upload_id AS 'Batch ID', filename AS 'File Name', currency AS 'Currency',"
-        " record_count AS 'Records', upload_date AS 'Uploaded On', uploaded_by AS 'By'"
-        " FROM Upload_Batches ORDER BY upload_date DESC",
-        conn
+        'SELECT upload_id AS "Batch ID", filename AS "File Name", currency AS "Currency",'
+        ' record_count AS "Records", upload_date AS "Uploaded On", uploaded_by AS "By"'
+        ' FROM Upload_Batches ORDER BY upload_date DESC',
+        get_engine()
     )
-    conn.close()
 
     if not batches.empty:
         st.dataframe(batches, use_container_width=True, hide_index=True)
@@ -1370,13 +1441,15 @@ def page_upload():
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("🚨 Delete Batch", type="primary"):
                 b_id = del_sel.split(" — ")[0]
-                backup_path = backup_db()
+                backup_bytes = export_backup_json()
                 with get_conn() as conn2:
                     conn2.execute("DELETE FROM Projects WHERE upload_id=?", (b_id,))
                     conn2.execute("DELETE FROM Disbursements WHERE upload_id=?", (b_id,))
                     conn2.execute("DELETE FROM Upload_Batches WHERE upload_id=?", (b_id,))
                     conn2.commit()
-                log_action(st.session_state.username, "DELETE_BATCH", f"{b_id} backup={backup_path}")
+                log_action(st.session_state.username, "DELETE_BATCH", f"{b_id} pre-delete backup exported")
+                st.session_state['_last_backup'] = backup_bytes
+                st.session_state['_last_backup_name'] = f"backup_before_delete_{b_id}.json"
                 st.success(f"Deleted batch {b_id}")
                 st.rerun()
     else:
@@ -1385,16 +1458,26 @@ def page_upload():
     with st.expander("⚠️ Danger Zone: Wipe Entire Database"):
         st.warning("This permanently deletes ALL projects, disbursements, and upload history.")
         if st.button("☠️ Wipe All Data", type="primary"):
-            backup_path = backup_db()
+            backup_bytes = export_backup_json()
             with get_conn() as conn3:
                 conn3.execute("DELETE FROM Projects")
                 conn3.execute("DELETE FROM Disbursements")
                 conn3.execute("DELETE FROM Upload_Batches")
                 conn3.commit()
-            log_action(st.session_state.username, "WIPE_DB",
-                       f"Admin wiped entire database backup={backup_path}")
+            log_action(st.session_state.username, "WIPE_DB", "Admin wiped entire database; pre-wipe backup exported")
+            st.session_state['_last_backup'] = backup_bytes
+            st.session_state['_last_backup_name'] = f"backup_before_wipe_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
             st.success("Database cleared.")
             st.rerun()
+
+    if st.session_state.get('_last_backup'):
+        st.markdown("---")
+        st.download_button(
+            "💾 Download pre-delete backup (JSON)",
+            data=st.session_state['_last_backup'],
+            file_name=st.session_state.get('_last_backup_name', 'backup.json'),
+            mime="application/json",
+        )
 
 
 # ─────────────────────────────────────────────
@@ -1403,9 +1486,7 @@ def page_upload():
 def page_settings():
     st.title("⚙️ System Settings — Five Year Plans")
 
-    conn = get_conn()
-    fyp_df = pd.read_sql("SELECT id, name, start_year, end_year FROM FYP_Config ORDER BY start_year", conn)
-    conn.close()
+    fyp_df = pd.read_sql("SELECT id, name, start_year, end_year FROM FYP_Config ORDER BY start_year", get_engine())
 
     st.dataframe(fyp_df, use_container_width=True, hide_index=True)
     st.markdown("---")
@@ -1433,19 +1514,19 @@ def page_settings():
 def page_users():
     st.title("👥 User Management & Security")
 
-    conn = get_conn()
+    engine = get_engine()
     users = pd.read_sql(
         "SELECT id, username, role, allowed_partners, view_only, hidden_columns, hidden_projects, hidden_partners FROM Users",
-        conn
+        engine
     )
     try:
         partners_list = pd.read_sql(
             "SELECT DISTINCT creditor FROM Projects WHERE creditor IS NOT NULL ORDER BY creditor",
-            conn
+            engine
         )['creditor'].tolist()
         proj_df = pd.read_sql(
             "SELECT DISTINCT instrument_id, title, creditor FROM Projects ORDER BY instrument_id",
-            conn
+            engine
         )
         project_options = [
             f"{r['instrument_id']} - {r['title'] or 'Unknown'} ({r['creditor'] or 'N/A'})"
@@ -1455,7 +1536,6 @@ def page_users():
         partners_list, project_options = [], []
         log_action(st.session_state.get('username', 'system'), "ERROR",
                    f"page_users: partners/project query failed: {e}")
-    conn.close()
 
     disp = users.copy()
     disp['view_only'] = disp['view_only'].map({1: '🔒 View Only', 0: '✏️ Edit'})
@@ -1606,12 +1686,10 @@ def page_users():
 # ─────────────────────────────────────────────
 def page_audit():
     st.title("📋 Audit Log")
-    conn = get_conn()
     log = pd.read_sql(
         "SELECT username, action, detail, timestamp FROM Audit_Log ORDER BY timestamp DESC LIMIT 500",
-        conn
+        get_engine()
     )
-    conn.close()
     st.dataframe(log, use_container_width=True, hide_index=True)
     st.caption(f"Showing up to 500 most recent entries. Total: {len(log)}")
 
