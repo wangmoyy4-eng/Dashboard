@@ -9,6 +9,8 @@ from sqlalchemy import create_engine
 from urllib.parse import quote_plus
 import plotly.express as px
 import hashlib
+import hmac
+import secrets
 import re
 import traceback
 from datetime import datetime, date, time as dt_time
@@ -373,8 +375,29 @@ init_db()
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
-def hash_pw(pw):
-    return hashlib.sha256(str(pw).encode()).hexdigest()
+def hash_pw(pw, iterations=260_000):
+    """Salted PBKDF2-SHA256, stored as 'pbkdf2_sha256$<iterations>$<salt>$<hash>'."""
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac('sha256', str(pw).encode(), bytes.fromhex(salt), iterations)
+    return f"pbkdf2_sha256${iterations}${salt}${dk.hex()}"
+
+
+def verify_pw(pw, stored):
+    """Returns (matches, needs_upgrade). Accepts both the new salted format and
+    the old unsalted sha256 hex digest, so existing accounts keep working —
+    a successful legacy match is flagged for silent upgrade on login."""
+    if not stored:
+        return False, False
+    if stored.startswith('pbkdf2_sha256$'):
+        try:
+            _, iter_s, salt, hash_hex = stored.split('$')
+            dk = hashlib.pbkdf2_hmac('sha256', str(pw).encode(), bytes.fromhex(salt), int(iter_s))
+            return hmac.compare_digest(dk.hex(), hash_hex), False
+        except Exception:
+            return False, False
+    else:
+        legacy_match = hmac.compare_digest(hashlib.sha256(str(pw).encode()).hexdigest(), stored)
+        return legacy_match, legacy_match
 
 
 def log_action(username, action, detail=""):
@@ -679,11 +702,17 @@ def show_login():
                 return st.error("Enter both username and password.")
             conn = get_conn()
             row = conn.execute(
-                "SELECT * FROM Users WHERE username=? AND password=?",
-                (username, hash_pw(password))
+                "SELECT * FROM Users WHERE username=?",
+                (username,)
             ).fetchone()
             conn.close()
-            if row:
+            matches, needs_upgrade = verify_pw(password, row[2]) if row else (False, False)
+            if row and matches:
+                if needs_upgrade:
+                    with get_conn() as uconn:
+                        uconn.execute("UPDATE Users SET password=? WHERE username=?",
+                                      (hash_pw(password), username))
+                        uconn.commit()
                 st.session_state.logged_in        = True
                 st.session_state.username         = row[1]
                 st.session_state.role             = row[3]
