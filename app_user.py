@@ -2,21 +2,31 @@
 DCDMD Dashboard - USER READ-ONLY VERSION
 Dashboard-only interface for 3rd-party users and staff
 No upload, management, or settings pages
+
+IMPORTANT: this file now shares the exact same Postgres/Supabase connection,
+password verification, and hiding logic as app.py. It previously ran on a
+disconnected local SQLite file (dashboard_data.db) with plain SHA-256
+passwords, which is why data here could look stale/wrong and why
+per-user hiding configured in app.py's User Management page had no effect.
 """
 import os
 import streamlit as st
 import pandas as pd
 import numpy as np
-import sqlite3
-import plotly.express as px
 import hashlib
+import hmac
+import secrets
 import re
 import traceback
+from urllib.parse import quote_plus
+from sqlalchemy import create_engine
+import plotly.express as px
 from datetime import datetime, date, time as dt_time
 from pathlib import Path
 
 # ─────────────────────────────────────────────
-# OPENPYXL BUG FIX
+# OPENPYXL BUG FIX (kept for parity — unused here since this app never
+# parses uploads, but harmless and keeps the two files easy to diff)
 # ─────────────────────────────────────────────
 import openpyxl.descriptors.base
 _original_convert = openpyxl.descriptors.base._convert
@@ -38,7 +48,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-DB = os.environ.get('DASHBOARD_DB_PATH', 'dashboard_data.db')
 COLORS = {
     'loan':  '#E74C3C',
     'grant': '#2ECC71',
@@ -47,11 +56,101 @@ COLORS = {
 }
 
 
-def hash_pw(pw):
-    return hashlib.sha256(str(pw).encode()).hexdigest()
+# ─────────────────────────────────────────────
+# DATABASE — same Postgres (Supabase) engine + sqlite3-compatible wrapper
+# as app.py. This app is READ-ONLY: it never calls init_db(), never
+# creates tables, and never writes anything except Audit_Log.
+# ─────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def get_engine():
+    cfg = st.secrets["postgres"]
+    url = (
+        f"postgresql+psycopg2://{cfg['user']}:{quote_plus(str(cfg['password']))}"
+        f"@{cfg['host']}:{cfg['port']}/{cfg['dbname']}"
+    )
+    return create_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=10)
+
+
+class _CursorWrapper:
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, sql, params=None):
+        self._cur.execute(sql.replace('?', '%s'), params)
+        return self
+
+    def executemany(self, sql, seq_of_params):
+        self._cur.executemany(sql.replace('?', '%s'), seq_of_params)
+        return self
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+    def __iter__(self):
+        return iter(self._cur)
+
+
+class PGConn:
+    def __init__(self, raw_conn):
+        object.__setattr__(self, '_conn', raw_conn)
+
+    def cursor(self):
+        return _CursorWrapper(self._conn.cursor())
+
+    def execute(self, sql, params=None):
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def executemany(self, sql, seq_of_params):
+        cur = self.cursor()
+        cur.executemany(sql, seq_of_params)
+        return cur
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self._conn.commit()
+        else:
+            self._conn.rollback()
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
 
 def get_conn():
-    return sqlite3.connect(DB, check_same_thread=False)
+    return PGConn(get_engine().raw_connection())
+
+
+# ─────────────────────────────────────────────
+# HELPERS (password verification must match app.py exactly, or accounts
+# created/upgraded there won't be able to log in here)
+# ─────────────────────────────────────────────
+def hash_pw(pw, iterations=260_000):
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac('sha256', str(pw).encode(), bytes.fromhex(salt), iterations)
+    return f"pbkdf2_sha256${iterations}${salt}${dk.hex()}"
+
+
+def verify_pw(pw, stored):
+    """Returns (matches, needs_upgrade). Accepts both the new salted format and
+    the old unsalted sha256 hex digest, so existing accounts keep working."""
+    if not stored:
+        return False, False
+    if stored.startswith('pbkdf2_sha256$'):
+        try:
+            _, iter_s, salt, hash_hex = stored.split('$')
+            dk = hashlib.pbkdf2_hmac('sha256', str(pw).encode(), bytes.fromhex(salt), int(iter_s))
+            return hmac.compare_digest(dk.hex(), hash_hex), False
+        except Exception:
+            return False, False
+    else:
+        legacy_match = hmac.compare_digest(hashlib.sha256(str(pw).encode()).hexdigest(), stored)
+        return legacy_match, legacy_match
+
 
 def log_action(username, action, detail=""):
     try:
@@ -61,24 +160,37 @@ def log_action(username, action, detail=""):
     except Exception:
         pass
 
+
 def clean_val(v):
     if v is None: return None
     s = str(v).strip()
     return None if s in ('', 'nan', 'NaN', 'None', '-', 'N/A', '#REF!') else s
 
-def clean_num(v):
-    s = clean_val(v)
-    if s is None: return None
+# Tokens that mean "no value" wherever they show up — as literal text stored
+# in the DB from older uploads, not just genuinely-empty cells.
+BLANK_TOKENS = ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat')
+
+
+def clean_display(v, blank='N/A'):
+    """Render-time guard: turns literal junk text ('NaN', 'None', ...) that may
+    already be sitting in the database into a clean placeholder for display."""
+    if v is None:
+        return blank
     try:
-        return float(s.replace(',', ''))
-    except (ValueError, AttributeError):
-        return None
+        if pd.isna(v):
+            return blank
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    return blank if s.lower() in BLANK_TOKENS else s
+
 
 def classify(s):
     s = str(s or '').lower()
     if 'grant' in s: return 'Grant'
     if 'loan'  in s: return 'Loan'
     return 'Other'
+
 
 def assign_fyp(yr, fyp_config):
     if pd.isna(yr): return "No Disbursements"
@@ -97,7 +209,7 @@ def assign_fyp(yr, fyp_config):
 _defaults = {
     'logged_in': False, 'username': '', 'role': '',
     'allowed_partners': 'All', 'view_only': True,
-    'hidden_cols': [], 'hidden_projs': [],
+    'hidden_cols': [], 'hidden_projs': [], 'hidden_partners': [],
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -118,11 +230,17 @@ def show_login():
                 return st.error("Enter both username and password.")
             conn = get_conn()
             row = conn.execute(
-                "SELECT * FROM Users WHERE username=? AND password=?",
-                (username, hash_pw(password))
+                "SELECT * FROM Users WHERE username=?",
+                (username,)
             ).fetchone()
             conn.close()
-            if row:
+            matches, needs_upgrade = verify_pw(password, row[2]) if row else (False, False)
+            if row and matches:
+                if needs_upgrade:
+                    with get_conn() as uconn:
+                        uconn.execute("UPDATE Users SET password=? WHERE username=?",
+                                      (hash_pw(password), username))
+                        uconn.commit()
                 st.session_state.logged_in       = True
                 st.session_state.username        = row[1]
                 st.session_state.role            = row[3]
@@ -130,6 +248,7 @@ def show_login():
                 st.session_state.view_only       = bool(row[5])
                 st.session_state.hidden_cols     = [c for c in row[6].split(',') if c] if row[6] else []
                 st.session_state.hidden_projs    = [p for p in row[7].split(',') if p] if row[7] else []
+                st.session_state.hidden_partners = [p for p in row[8].split(',') if p] if (len(row) > 8 and row[8]) else []
                 log_action(username, "LOGIN_USER")
                 st.rerun()
             else:
@@ -154,7 +273,7 @@ def render_sidebar():
 def page_dashboard():
     st.title("📊 DCDMD Project Dashboard")
 
-    conn = get_conn()
+    engine = get_engine()
     df_all = pd.read_sql('''
         SELECT p.instrument_id, p.title, p.agreement_structure, p.creditor,
                p.agreement_date, p.maturity_date, p.amount, p.revised_amount,
@@ -163,10 +282,9 @@ def page_dashboard():
                d.year AS disbursement_year, d.amount AS disbursed_amount
         FROM Projects p
         LEFT JOIN Disbursements d ON p.instrument_id = d.instrument_id
-    ''', conn)
-    rates_df  = pd.read_sql("SELECT * FROM Exchange_Rates", conn).set_index('currency_code')
-    fyp_config = pd.read_sql("SELECT * FROM FYP_Config ORDER BY start_year", conn)
-    conn.close()
+    ''', engine)
+    rates_df   = pd.read_sql("SELECT * FROM Exchange_Rates", engine).set_index('currency_code')
+    fyp_config = pd.read_sql("SELECT * FROM FYP_Config ORDER BY start_year", engine)
 
     if df_all.empty:
         return st.warning("⚠️ No data available yet.")
@@ -174,9 +292,20 @@ def page_dashboard():
     # ── Security filters ────────────────────────────────────────────────────
     if st.session_state.hidden_projs:
         df_all = df_all[~df_all['instrument_id'].isin(st.session_state.hidden_projs)]
+
     if st.session_state.allowed_partners != 'All':
         allowed = [p.strip() for p in st.session_state.allowed_partners.split(',')]
         df_all  = df_all[df_all['creditor'].isin(allowed)]
+
+    hidden_partners = st.session_state.get('hidden_partners') or []
+    if hidden_partners:
+        hidden_set = {str(hp).strip().lower() for hp in hidden_partners if hp}
+        def _is_hidden_partner(creditor_val):
+            if creditor_val is None or (isinstance(creditor_val, float) and pd.isna(creditor_val)):
+                return False
+            return str(creditor_val).strip().lower() in hidden_set
+        df_all = df_all[~df_all['creditor'].apply(_is_hidden_partner)]
+
     if df_all.empty:
         return st.warning("No data available for your account.")
 
@@ -313,7 +442,7 @@ def page_dashboard():
     col3, col4 = st.columns([1, 1.2])
 
     with col3:
-        st.subheader("🌐 Creditor Power")
+        st.subheader("🌐 Creditor Share")
         cred_pie = (dff[dff['display_amount'] > 0]
                     .groupby('creditor')['display_amount'].sum().reset_index())
         if not cred_pie.empty:
@@ -325,7 +454,7 @@ def page_dashboard():
             st.plotly_chart(fig3, use_container_width=True)
 
     with col4:
-        st.subheader("🏭 Agency Workload")
+        st.subheader("🏭 Agency Allocation")
         agency_bar = (dff[dff['display_amount'] > 0]
                       .groupby(['main_implementing_agency', 'type'])['display_amount']
                       .sum().reset_index()
@@ -373,20 +502,25 @@ def page_dashboard():
         ptype = p['type']
         tc = COLORS['grant'] if ptype == 'Grant' else (COLORS['loan'] if ptype == 'Loan' else COLORS['other'])
 
+        def safe_val(col_key):
+            if col_key in st.session_state.hidden_cols:
+                return "🔒 Hidden"
+            return clean_display(p.get(col_key))
+
         ci1, ci2 = st.columns([1, 1])
         with ci1:
             st.markdown(f"""
             <div style="background:{COLORS['card']};border-radius:12px;padding:20px;border-left:4px solid {tc}">
-                <h4 style="margin:0 0 12px;color:#fff">{p.get('title','Unknown')}</h4>
+                <h4 style="margin:0 0 12px;color:#fff">{clean_display(p.get('title'))}</h4>
                 <table style="width:100%;color:#ccc;font-size:13px;border-collapse:collapse">
                     <tr><td><b>🆔 Instrument ID</b></td><td style="text-align:right">{p['instrument_id']}</td></tr>
                     <tr><td><b>🏷️ Type</b></td><td style="text-align:right"><span style="color:{tc};font-weight:bold">{ptype}</span></td></tr>
-                    <tr><td><b>🤝 Creditor</b></td><td style="text-align:right">{p.get('creditor','N/A')}</td></tr>
-                    <tr><td><b>🏛️ Agency</b></td><td style="text-align:right">{p.get('main_implementing_agency','N/A')}</td></tr>
-                    <tr><td><b>📅 Agreement Date</b></td><td style="text-align:right">{p.get('agreement_date','N/A')}</td></tr>
-                    <tr><td><b>🏁 Maturity Date</b></td><td style="text-align:right">{p.get('maturity_date','N/A')}</td></tr>
-                    <tr><td><b>💳 Original Amount</b></td><td style="text-align:right">{p.get('amount','N/A')}</td></tr>
-                    <tr><td><b>🔄 Revised Amount</b></td><td style="text-align:right">{p.get('revised_amount','N/A')}</td></tr>
+                    <tr><td><b>🤝 Creditor</b></td><td style="text-align:right">{clean_display(p.get('creditor'))}</td></tr>
+                    <tr><td><b>🏛️ Agency</b></td><td style="text-align:right">{clean_display(p.get('main_implementing_agency'))}</td></tr>
+                    <tr><td><b>📅 Agreement Date</b></td><td style="text-align:right">{safe_val('agreement_date')}</td></tr>
+                    <tr><td><b>🏁 Maturity Date</b></td><td style="text-align:right">{safe_val('maturity_date')}</td></tr>
+                    <tr><td><b>💳 Original Amount</b></td><td style="text-align:right">{safe_val('amount')}</td></tr>
+                    <tr><td><b>🔄 Revised Amount</b></td><td style="text-align:right">{safe_val('revised_amount')}</td></tr>
                     <tr style="border-top:1px solid #444">
                         <td><b>💰 Total Disbursed</b></td>
                         <td style="text-align:right"><b style="color:#fff">{total_disb:,.2f} {unit}</b></td>
@@ -415,6 +549,11 @@ def page_dashboard():
 
         base_cols = ['instrument_id', 'title', 'creditor', 'agreement_structure',
                      'main_implementing_agency', 'currency']
+        secure_cols = ['agreement_date', 'maturity_date', 'amount', 'revised_amount']
+        for sc in secure_cols:
+            if sc not in st.session_state.hidden_cols:
+                base_cols.append(sc)
+
         df_base = dff[base_cols].drop_duplicates('instrument_id')
 
         if not dff['disbursement_year'].isna().all():
@@ -447,7 +586,13 @@ def page_dashboard():
             ).any(axis=1)
             df_display = df_display[mask]
 
-        st.dataframe(df_display, use_container_width=True, hide_index=True)
+        df_display_fmt = df_display.copy()
+        for txt_col in ['title', 'creditor', 'agreement_structure', 'main_implementing_agency',
+                        'currency', 'agreement_date', 'maturity_date']:
+            if txt_col in df_display_fmt.columns:
+                df_display_fmt[txt_col] = df_display_fmt[txt_col].apply(lambda v: clean_display(v, blank=''))
+
+        st.dataframe(df_display_fmt, use_container_width=True, hide_index=True)
         st.caption(f"Showing {len(df_display)} projects | Unit: {unit}")
 
 
