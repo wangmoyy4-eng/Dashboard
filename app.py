@@ -414,6 +414,24 @@ def clean_val(v):
     s = str(v).strip()
     return None if s in ('', 'nan', 'NaN', 'None', '-', 'N/A', '#REF!') else s
 
+# Tokens that mean "no value" wherever they show up — as literal text stored
+# in the DB from older uploads, not just genuinely-empty cells.
+BLANK_TOKENS = ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat')
+
+
+def clean_display(v, blank='N/A'):
+    """Render-time guard: turns literal junk text ('NaN', 'None', ...) that may
+    already be sitting in the database into a clean placeholder for display."""
+    if v is None:
+        return blank
+    try:
+        if pd.isna(v):
+            return blank
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    return blank if s.lower() in BLANK_TOKENS else s
+
 
 def clean_num(v):
     s = clean_val(v)
@@ -1017,18 +1035,18 @@ def page_dashboard():
         def safe_val(col_key):
             if st.session_state.role != 'Admin' and col_key in st.session_state.hidden_cols:
                 return "🔒 Hidden"
-            return p[col_key] if pd.notna(p.get(col_key)) else 'N/A'
+            return clean_display(p.get(col_key))
 
         ci1, ci2 = st.columns([1, 1])
         with ci1:
             st.markdown(f"""
             <div style="background:{COLORS['card']};border-radius:12px;padding:20px;border-left:4px solid {tc}">
-                <h4 style="margin:0 0 12px;color:#fff">{p.get('title','Unknown')}</h4>
+                <h4 style="margin:0 0 12px;color:#fff">{clean_display(p.get('title'))}</h4>
                 <table style="width:100%;color:#ccc;font-size:13px;border-collapse:collapse">
                     <tr><td><b>🆔 Instrument ID</b></td><td style="text-align:right">{p['instrument_id']}</td></tr>
                     <tr><td><b>🏷️ Type</b></td><td style="text-align:right"><span style="color:{tc};font-weight:bold">{ptype}</span></td></tr>
-                    <tr><td><b>🤝 Creditor</b></td><td style="text-align:right">{p.get('creditor','N/A')}</td></tr>
-                    <tr><td><b>🏛️ Agency</b></td><td style="text-align:right">{p.get('main_implementing_agency','N/A')}</td></tr>
+                    <tr><td><b>🤝 Creditor</b></td><td style="text-align:right">{clean_display(p.get('creditor'))}</td></tr>
+                    <tr><td><b>🏛️ Agency</b></td><td style="text-align:right">{clean_display(p.get('main_implementing_agency'))}</td></tr>
                     <tr><td><b>📅 Agreement Date</b></td><td style="text-align:right">{safe_val('agreement_date')}</td></tr>
                     <tr><td><b>🏁 Maturity Date</b></td><td style="text-align:right">{safe_val('maturity_date')}</td></tr>
                     <tr><td><b>💳 Original Amount</b></td><td style="text-align:right">{safe_val('amount')}</td></tr>
@@ -1114,6 +1132,10 @@ def page_dashboard():
                 return v
 
         df_display_fmt = df_display.copy()
+        for txt_col in ['title', 'creditor', 'agreement_structure', 'main_implementing_agency',
+                        'currency', 'agreement_date', 'maturity_date']:
+            if txt_col in df_display_fmt.columns:
+                df_display_fmt[txt_col] = df_display_fmt[txt_col].apply(lambda v: clean_display(v, blank=''))
         for yr_col in year_col_list:
             if yr_col in df_display_fmt.columns:
                 df_display_fmt[yr_col] = df_display_fmt[yr_col].apply(lambda v: _fmt_commas(v, 0))
@@ -1358,17 +1380,17 @@ def page_upload():
                                 main_implementing_agency, currency, upload_id, file_type
                             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                             ON CONFLICT(instrument_id) DO UPDATE SET
-                                title = CASE WHEN Projects.title IS NULL OR Projects.title='' THEN NULLIF(excluded.title,'') ELSE Projects.title END,
-                                agreement_structure = CASE WHEN Projects.agreement_structure IS NULL OR Projects.agreement_structure='' THEN NULLIF(excluded.agreement_structure,'') ELSE Projects.agreement_structure END,
-                                creditor = CASE WHEN Projects.creditor IS NULL OR Projects.creditor='' THEN NULLIF(excluded.creditor,'') ELSE Projects.creditor END,
-                                agreement_date = CASE WHEN Projects.agreement_date IS NULL OR Projects.agreement_date='' THEN NULLIF(excluded.agreement_date,'') ELSE Projects.agreement_date END,
-                                maturity_date = CASE WHEN Projects.maturity_date IS NULL OR Projects.maturity_date='' THEN NULLIF(excluded.maturity_date,'') ELSE Projects.maturity_date END,
+                                title = CASE WHEN Projects.title IS NULL OR TRIM(LOWER(Projects.title)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.title),'') ELSE Projects.title END,
+                                agreement_structure = CASE WHEN Projects.agreement_structure IS NULL OR TRIM(LOWER(Projects.agreement_structure)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.agreement_structure),'') ELSE Projects.agreement_structure END,
+                                creditor = CASE WHEN Projects.creditor IS NULL OR TRIM(LOWER(Projects.creditor)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.creditor),'') ELSE Projects.creditor END,
+                                agreement_date = CASE WHEN Projects.agreement_date IS NULL OR TRIM(LOWER(Projects.agreement_date)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.agreement_date),'') ELSE Projects.agreement_date END,
+                                maturity_date = CASE WHEN Projects.maturity_date IS NULL OR TRIM(LOWER(Projects.maturity_date)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.maturity_date),'') ELSE Projects.maturity_date END,
                                 amount = CASE WHEN Projects.amount IS NULL THEN excluded.amount ELSE Projects.amount END,
                                 revised_amount = CASE WHEN Projects.revised_amount IS NULL THEN excluded.revised_amount ELSE Projects.revised_amount END,
-                                economic_sector = CASE WHEN Projects.economic_sector IS NULL OR Projects.economic_sector='' THEN NULLIF(excluded.economic_sector,'') ELSE Projects.economic_sector END,
-                                instrument_fund_use = CASE WHEN Projects.instrument_fund_use IS NULL OR Projects.instrument_fund_use='' THEN NULLIF(excluded.instrument_fund_use,'') ELSE Projects.instrument_fund_use END,
-                                main_implementing_agency = CASE WHEN Projects.main_implementing_agency IS NULL OR Projects.main_implementing_agency='' THEN NULLIF(excluded.main_implementing_agency,'') ELSE Projects.main_implementing_agency END,
-                                currency = CASE WHEN Projects.currency IS NULL OR Projects.currency='' THEN NULLIF(excluded.currency,'') ELSE Projects.currency END,
+                                economic_sector = CASE WHEN Projects.economic_sector IS NULL OR TRIM(LOWER(Projects.economic_sector)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.economic_sector),'') ELSE Projects.economic_sector END,
+                                instrument_fund_use = CASE WHEN Projects.instrument_fund_use IS NULL OR TRIM(LOWER(Projects.instrument_fund_use)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.instrument_fund_use),'') ELSE Projects.instrument_fund_use END,
+                                main_implementing_agency = CASE WHEN Projects.main_implementing_agency IS NULL OR TRIM(LOWER(Projects.main_implementing_agency)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.main_implementing_agency),'') ELSE Projects.main_implementing_agency END,
+                                currency = CASE WHEN Projects.currency IS NULL OR TRIM(LOWER(Projects.currency)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.currency),'') ELSE Projects.currency END,
                                 upload_id = excluded.upload_id,
                                 file_type = excluded.file_type
                         '''
@@ -1382,16 +1404,16 @@ def page_upload():
                                 main_implementing_agency, currency, upload_id, file_type
                             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                             ON CONFLICT(instrument_id) DO UPDATE SET
-                                title = CASE WHEN Projects.title IS NULL OR Projects.title='' THEN NULLIF(excluded.title,'') ELSE Projects.title END,
-                                agreement_structure = CASE WHEN Projects.agreement_structure IS NULL OR Projects.agreement_structure='' THEN NULLIF(excluded.agreement_structure,'') ELSE Projects.agreement_structure END,
-                                creditor = CASE WHEN Projects.creditor IS NULL OR Projects.creditor='' THEN NULLIF(excluded.creditor,'') ELSE Projects.creditor END,
-                                agreement_date = CASE WHEN Projects.agreement_date IS NULL OR Projects.agreement_date='' THEN NULLIF(excluded.agreement_date,'') ELSE Projects.agreement_date END,
-                                maturity_date = CASE WHEN Projects.maturity_date IS NULL OR Projects.maturity_date='' THEN NULLIF(excluded.maturity_date,'') ELSE Projects.maturity_date END,
+                                title = CASE WHEN Projects.title IS NULL OR TRIM(LOWER(Projects.title)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.title),'') ELSE Projects.title END,
+                                agreement_structure = CASE WHEN Projects.agreement_structure IS NULL OR TRIM(LOWER(Projects.agreement_structure)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.agreement_structure),'') ELSE Projects.agreement_structure END,
+                                creditor = CASE WHEN Projects.creditor IS NULL OR TRIM(LOWER(Projects.creditor)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.creditor),'') ELSE Projects.creditor END,
+                                agreement_date = CASE WHEN Projects.agreement_date IS NULL OR TRIM(LOWER(Projects.agreement_date)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.agreement_date),'') ELSE Projects.agreement_date END,
+                                maturity_date = CASE WHEN Projects.maturity_date IS NULL OR TRIM(LOWER(Projects.maturity_date)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.maturity_date),'') ELSE Projects.maturity_date END,
                                 amount = COALESCE(excluded.amount, Projects.amount),
                                 revised_amount = COALESCE(excluded.revised_amount, Projects.revised_amount),
-                                economic_sector = CASE WHEN Projects.economic_sector IS NULL OR Projects.economic_sector='' THEN NULLIF(excluded.economic_sector,'') ELSE Projects.economic_sector END,
-                                instrument_fund_use = CASE WHEN Projects.instrument_fund_use IS NULL OR Projects.instrument_fund_use='' THEN NULLIF(excluded.instrument_fund_use,'') ELSE Projects.instrument_fund_use END,
-                                main_implementing_agency = CASE WHEN Projects.main_implementing_agency IS NULL OR Projects.main_implementing_agency='' THEN NULLIF(excluded.main_implementing_agency,'') ELSE Projects.main_implementing_agency END,
+                                economic_sector = CASE WHEN Projects.economic_sector IS NULL OR TRIM(LOWER(Projects.economic_sector)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.economic_sector),'') ELSE Projects.economic_sector END,
+                                instrument_fund_use = CASE WHEN Projects.instrument_fund_use IS NULL OR TRIM(LOWER(Projects.instrument_fund_use)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.instrument_fund_use),'') ELSE Projects.instrument_fund_use END,
+                                main_implementing_agency = CASE WHEN Projects.main_implementing_agency IS NULL OR TRIM(LOWER(Projects.main_implementing_agency)) IN ('', 'nan', 'none', 'n/a', '-', '#ref!', 'nat') THEN NULLIF(TRIM(excluded.main_implementing_agency),'') ELSE Projects.main_implementing_agency END,
                                 currency = COALESCE(excluded.currency, Projects.currency),
                                 upload_id = excluded.upload_id,
                                 file_type = excluded.file_type
