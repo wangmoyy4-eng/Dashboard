@@ -248,7 +248,8 @@ def show_login():
                 st.session_state.view_only       = bool(row[5])
                 st.session_state.hidden_cols     = [c for c in row[6].split(',') if c] if row[6] else []
                 st.session_state.hidden_projs    = [p for p in row[7].split(',') if p] if row[7] else []
-                st.session_state.hidden_partners = [p for p in row[8].split(',') if p] if (len(row) > 8 and row[8]) else []
+                # Partner names can contain commas, so this list uses '|' as its delimiter
+                st.session_state.hidden_partners = [p for p in row[8].split('|') if p] if (len(row) > 8 and row[8]) else []
                 log_action(username, "LOGIN_USER")
                 st.rerun()
             else:
@@ -294,7 +295,7 @@ def page_dashboard():
         df_all = df_all[~df_all['instrument_id'].isin(st.session_state.hidden_projs)]
 
     if st.session_state.allowed_partners != 'All':
-        allowed = [p.strip() for p in st.session_state.allowed_partners.split(',')]
+        allowed = [p.strip() for p in st.session_state.allowed_partners.split('|')]
         df_all  = df_all[df_all['creditor'].isin(allowed)]
 
     hidden_partners = st.session_state.get('hidden_partners') or []
