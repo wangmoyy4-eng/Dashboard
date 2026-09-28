@@ -738,7 +738,8 @@ def show_login():
                 st.session_state.view_only        = bool(row[5])
                 st.session_state.hidden_cols      = [c for c in row[6].split(',') if c] if row[6] else []
                 st.session_state.hidden_projs     = [p for p in row[7].split(',') if p] if row[7] else []
-                st.session_state.hidden_partners  = [p for p in row[8].split(',') if p] if (len(row) > 8 and row[8]) else []
+                # Partner names can contain commas, so this list uses '|' as its delimiter
+                st.session_state.hidden_partners  = [p for p in row[8].split('|') if p] if (len(row) > 8 and row[8]) else []
                 log_action(username, "LOGIN")
                 st.rerun()
             else:
@@ -795,7 +796,7 @@ def page_dashboard():
         df_all = df_all[~df_all['instrument_id'].isin(st.session_state.hidden_projs)]
 
     if st.session_state.allowed_partners != 'All':
-        allowed = [p.strip() for p in st.session_state.allowed_partners.split(',')]
+        allowed = [p.strip() for p in st.session_state.allowed_partners.split('|')]
         df_all  = df_all[df_all['creditor'].isin(allowed)]
 
     if st.session_state.role != 'Admin':
@@ -1643,7 +1644,8 @@ def page_users():
         prefill['hidden_cols']      = [c for c in str(row.get('hidden_columns') or '').split(',') if c]
         stored_ids                  = [p for p in str(row.get('hidden_projects') or '').split(',') if p]
         prefill['hidden_projs_raw'] = stored_ids
-        prefill['hidden_partners']  = [p for p in str(row.get('hidden_partners') or '').split(',') if p]
+        # Partner names can contain commas, so this list uses '|' as its delimiter
+        prefill['hidden_partners']  = [p for p in str(row.get('hidden_partners') or '').split('|') if p]
 
         st.info(
             f"**User:** `{row['username']}`  |  "
@@ -1703,7 +1705,8 @@ def page_users():
                 conn2 = get_conn()
                 hidden_ids      = ','.join([p.split(" - ")[0] for p in hidden_projs])
                 hidden_col_str  = ','.join(hidden_cols)
-                hidden_part_str = ','.join(hidden_partners)
+                # Partner names can contain commas, so join with '|' instead
+                hidden_part_str = '|'.join(hidden_partners)
 
                 existing = conn2.execute("SELECT password FROM Users WHERE username=?", (new_user,)).fetchone()
                 pw_hash  = hash_pw(new_pw) if new_pw else (existing[0] if existing else hash_pw('changeme'))
