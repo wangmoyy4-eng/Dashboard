@@ -433,6 +433,14 @@ def clean_display(v, blank='N/A'):
     return blank if s.lower() in BLANK_TOKENS else s
 
 
+def nn(v):
+    """Turn NaN/NaT/pd.NA into None so Postgres stores a real NULL."""
+    try:
+        return None if pd.isna(v) else v
+    except (TypeError, ValueError):
+        return v
+
+
 def clean_num(v):
     s = clean_val(v)
     if s is None: return None
@@ -1353,7 +1361,7 @@ def page_upload():
 
                         proj_tuples = []
                         for _, r in df_projects.iterrows():
-                            proj_tuples.append((
+                            proj_tuples.append(tuple(nn(x) for x in (
                                 r.get('instrument_id'), r.get('title'),
                                 r.get('agreement_structure'), r.get('creditor'),
                                 r.get('agreement_date'), r.get('maturity_date'),
@@ -1362,7 +1370,7 @@ def page_upload():
                                 r.get('main_implementing_agency'),
                                 r.get('currency') or user_currency,
                                 batch_id, detected_fmt
-                            ))
+                            )))
 
                         disb_tuples = []
                         if not df_disb.empty:
